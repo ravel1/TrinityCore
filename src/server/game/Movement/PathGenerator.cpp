@@ -943,8 +943,3 @@ void PathGenerator::ReducePathLenghtByDist(float dist)
         nextVec = currVec; // we're going backwards
     }
 }
-
-bool PathGenerator::IsInvalidDestinationZ(Unit const* target) const
-{
-    return (target->GetPositionZ() - GetActualEndPosition().z) > 5.0f;
-}

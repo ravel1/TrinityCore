@@ -55,7 +55,7 @@ Loot* Roll::getLoot()
     return getTarget();
 }
 
-Group::Group() : m_leaderGuid(), m_leaderName(""), m_groupFlags(GROUP_FLAG_NONE), m_groupCategory(GROUP_CATEGORY_HOME),
+Group::Group() : m_leaderGuid(), m_leaderName(""), m_groupFlags(GROUP_FLAG_NONE),
 m_dungeonDifficulty(DIFFICULTY_NORMAL), m_raidDifficulty(DIFFICULTY_NORMAL_RAID), m_legacyRaidDifficulty(DIFFICULTY_10_N),
 m_bgGroup(nullptr), m_bfGroup(nullptr), m_lootMethod(FREE_FOR_ALL), m_lootThreshold(ITEM_QUALITY_UNCOMMON), m_looterGuid(),
 m_masterLooterGuid(), m_subGroupsCounts(nullptr), m_guid(), m_maxEnchantingLevel(0), m_dbStoreId(0),
@@ -105,10 +105,7 @@ bool Group::Create(Player* leader)
     leader->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_GROUP_LEADER);
 
     if (isBGGroup() || isBFGroup())
-    {
         m_groupFlags = GROUP_MASK_BGRAID;
-        m_groupCategory = GROUP_CATEGORY_INSTANCE;
-    }
 
     if (m_groupFlags & GROUP_FLAG_RAID)
         _initRaidSubGroupsCounter();
@@ -230,7 +227,6 @@ void Group::LoadMemberFromDB(ObjectGuid::LowType guidLow, uint8 memberFlags, uin
 void Group::ConvertToLFG()
 {
     m_groupFlags = GroupFlags(m_groupFlags | GROUP_FLAG_LFG | GROUP_FLAG_LFG_RESTRICTED);
-    m_groupCategory = GROUP_CATEGORY_INSTANCE;
     m_lootMethod = GROUP_LOOT;
     if (!isBGGroup() && !isBFGroup())
     {
@@ -396,6 +392,7 @@ bool Group::AddMember(Player* player)
     member.group        = subGroup;
     member.flags        = 0;
     member.roles        = 0;
+    member.updateSequenceNumber = 1;
     member.readyChecked = false;
     m_memberSlots.push_back(member);
 
@@ -411,9 +408,6 @@ bool Group::AddMember(Player* player)
     }
     else //if player is not in group, then call set group
         player->SetGroup(this, subGroup);
-
-    player->SetPartyType(m_groupCategory, GROUP_TYPE_NORMAL);
-    player->ResetGroupUpdateSequenceIfNeeded(this);
 
     // if the same group invites the player back, cancel the homebind timer
     player->m_InstanceValid = player->CheckInstanceValidity(false);
@@ -544,6 +538,7 @@ bool Group::RemoveMember(ObjectGuid guid, const RemoveMethod& method /*= GROUP_R
     if (GetMembersCount() > ((isBGGroup() || isLFGGroup() || isBFGroup()) ? 1u : 2u))
     {
         Player* player = ObjectAccessor::FindConnectedPlayer(guid);
+        uint8 partyIndex = 0;
         if (player)
         {
             // Battleground group handling
@@ -555,13 +550,14 @@ bool Group::RemoveMember(ObjectGuid guid, const RemoveMethod& method /*= GROUP_R
                 if (player->GetOriginalGroup() == this)
                     player->SetOriginalGroup(NULL);
                 else
+                {
                     player->SetGroup(NULL);
+                    partyIndex = 1;
+                }
 
                 // quest related GO state dependent from raid membership
                 player->UpdateForQuestWorldObjects();
             }
-
-            player->SetPartyType(m_groupCategory, GROUP_TYPE_NONE);
 
             WorldPacket data;
 
@@ -615,9 +611,11 @@ bool Group::RemoveMember(ObjectGuid guid, const RemoveMethod& method /*= GROUP_R
         }
 
         // Update subgroups
+        int32 updateSequenceNumber = 1;
         member_witerator slot = _getMemberWSlot(guid);
         if (slot != m_memberSlots.end())
         {
+            updateSequenceNumber = slot->updateSequenceNumber;
             SubGroupCounterDecrease(slot->group);
             m_memberSlots.erase(slot);
         }
@@ -653,7 +651,7 @@ bool Group::RemoveMember(ObjectGuid guid, const RemoveMethod& method /*= GROUP_R
         else if (player)
         {
             // send update to removed player too so party frames are destroyed clientside
-            SendUpdateDestroyGroupToPlayer(player);
+            SendUpdateDestroyGroupToPlayer(player, partyIndex, updateSequenceNumber);
         }
 
         return true;
@@ -796,16 +794,26 @@ void Group::Disband(bool hideDestroy /* = false */)
                 player->SetGroup(NULL);
         }
 
-        player->SetPartyType(m_groupCategory, GROUP_TYPE_NONE);
-
         // quest related GO state dependent from raid membership
         if (isRaidGroup())
             player->UpdateForQuestWorldObjects();
 
+        if (!player->GetSession())
+            continue;
+
         if (!hideDestroy)
             player->SendDirectMessage(WorldPackets::Party::GroupDestroyed().Write());
 
-        SendUpdateDestroyGroupToPlayer(player);
+        uint8 disbandedPartyIndex = 0;
+
+        //we already removed player from group and in player->GetGroup() is his original group, send update
+        if (Group* group = player->GetGroup())
+        {
+            group->SendUpdate();
+            disbandedPartyIndex = 1;
+        }
+
+        SendUpdateDestroyGroupToPlayer(player, disbandedPartyIndex, citr->updateSequenceNumber);
 
         _homebindIfInstance(player);
     }
@@ -1420,13 +1428,13 @@ void Group::SendUpdateToPlayer(ObjectGuid playerGUID, MemberSlot* slot)
     WorldPackets::Party::PartyUpdate partyUpdate;
 
     partyUpdate.PartyFlags = m_groupFlags;
-    partyUpdate.PartyIndex = m_groupCategory;
+    partyUpdate.PartyIndex = (player->GetOriginalGroup() && player->GetOriginalGroup() != this) ? 1 : 0; // 0 = original group, 1 = instance/bg group
     partyUpdate.PartyType = IsCreated() ? GROUP_TYPE_NORMAL : GROUP_TYPE_NONE;
 
     partyUpdate.PartyGUID = m_guid;
     partyUpdate.LeaderGUID = m_leaderGuid;
 
-    partyUpdate.SequenceNum = player->NextGroupUpdateSequenceNumber(m_groupCategory);
+    partyUpdate.SequenceNum = slot->updateSequenceNumber++;              // 3.3, value increases every time this packet gets sent
 
     partyUpdate.MyIndex = -1;
     uint8 index = 0;
@@ -1501,15 +1509,15 @@ void Group::SendUpdateToPlayer(ObjectGuid playerGUID, MemberSlot* slot)
     player->GetSession()->SendPacket(partyUpdate.Write());
 }
 
-void Group::SendUpdateDestroyGroupToPlayer(Player* player) const
+void Group::SendUpdateDestroyGroupToPlayer(Player* player, uint8 partyIndex, int32 sequenceNum) const
 {
     WorldPackets::Party::PartyUpdate partyUpdate;
     partyUpdate.PartyFlags = GROUP_FLAG_DESTROYED;
-    partyUpdate.PartyIndex = m_groupCategory;
+    partyUpdate.PartyIndex = partyIndex;
     partyUpdate.PartyType = GROUP_TYPE_NONE;
     partyUpdate.PartyGUID = m_guid;
     partyUpdate.MyIndex = -1;
-    partyUpdate.SequenceNum = player->NextGroupUpdateSequenceNumber(m_groupCategory);
+    partyUpdate.SequenceNum = sequenceNum;
     player->GetSession()->SendPacket(partyUpdate.Write());
 }
 
